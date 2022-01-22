@@ -181,7 +181,7 @@ func (lc *ldapClient) AddMembers(m []string) {
 	defer lc.mtx.Unlock()
 	lc.members = m
 	lc.revision++
-	log.Printf("Current members are: %v. Current Revision: %v\n", lc.members, lc.revision)
+	log.Printf("Current members are: %v. Total %v. Current Revision: %v\n", lc.members, len(lc.members), lc.revision)
 }
 
 func (lc *ldapClient) AddMemberUpdate(m string) {
@@ -215,7 +215,7 @@ func (lc *ldapClient) GetRevision() int {
 
 func parsePreferWait(r *http.Request) (time.Duration, error) {
 	for _, line := range r.Header.Values("prefer") {
-		for _, part := range strings.Split(line, ",") {
+		for _, part := range strings.Split(line, ";") {
 			preference := strings.Split(strings.TrimSpace(part), "=")
 			if len(preference) == 2 {
 				if strings.ToLower(preference[0]) == "wait" {
@@ -226,6 +226,20 @@ func parsePreferWait(r *http.Request) (time.Duration, error) {
 		}
 	}
 	return 0, nil
+}
+
+func parsePreferMode(r *http.Request) []string {
+	for _, line := range r.Header.Values("prefer") {
+		for _, part := range strings.Split(line, ";") {
+			preference := strings.Split(strings.TrimSpace(part), "=")
+			if len(preference) == 2 {
+				if strings.ToLower(preference[0]) == "modes" {
+					return strings.Split(preference[1], ",")
+				}
+			}
+		}
+	}
+	return []string{}
 }
 
 func (s *server) Serve(w http.ResponseWriter, r *http.Request) {
@@ -247,6 +261,61 @@ func (s *server) Serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	rev := s.lc.GetRevision()
+
+	if !s.deltaMode {
+		if clientRevision == 0 || clientRevision != rev {
+			log.Printf("client is out-of-date, server revision is %d, sending snapshot bundle...", rev)
+			s.writeSnapshotBundle(w, rev)
+		} else {
+			time.Sleep(clientWait)
+			w.Header().Set("Content-Type", "application/vnd.openpolicyagent.bundles")
+			w.WriteHeader(304)
+		}
+	} else {
+		if clientRevision == 0 {
+			log.Printf("client's first update, server revision is %d, sending snapshot bundle...", rev)
+			s.writeSnapshotBundle(w, rev)
+		} else {
+			ch := make(chan update)
+
+			log.Printf("client is up-to-date, server revision is %d, waiting for change...", rev)
+			s.lc.AddSubscribers(ch)
+
+			select {
+			case u := <-ch:
+				log.Printf("Sending update in delta bundle: %+v\n", u)
+				b := bundle.Bundle{
+					Manifest: bundle.Manifest{
+						Revision: fmt.Sprintf("%d", u.revision),
+					},
+					Patch: bundle.Patch{
+						Data: []bundle.PatchOperation{
+							{
+								Op:    "upsert",
+								Path:  "/members/-",
+								Value: u.data,
+							},
+						},
+					},
+				}
+				w.Header().Set("content-type", "application/vnd.openpolicyagent.bundles")
+				w.Header().Set("etag", fmt.Sprintf("%d", u.revision))
+				err := bundle.NewWriter(w).Write(b)
+				if err != nil {
+					log.Printf("error creating delta bundle: %v\n", err)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+			case <-time.After(clientWait):
+				w.Header().Set("Content-Type", "application/vnd.openpolicyagent.bundles")
+				w.WriteHeader(304)
+			}
+		}
+	}
+}
+
+func (s *server) writeSnapshotBundle(w http.ResponseWriter, revision int) {
 	module := `package example
 
 	default allow = false
@@ -257,69 +326,28 @@ func (s *server) Serve(w http.ResponseWriter, r *http.Request) {
 
 	modulePath := "example/example.rego"
 
-	rev := s.lc.GetRevision()
-	if !s.deltaMode || clientRevision == 0 || clientRevision != rev {
-		log.Printf("client is out-of-date, server revision is %d, sending snapshot...", rev)
-		b := bundle.Bundle{
-			Manifest: bundle.Manifest{
-				Revision: fmt.Sprintf("%d", rev),
+	b := bundle.Bundle{
+		Manifest: bundle.Manifest{
+			Revision: fmt.Sprintf("%d", revision),
+		},
+		Data: map[string]interface{}{
+			"members": s.lc.GetMembers(),
+		},
+		Modules: []bundle.ModuleFile{
+			{
+				URL:    modulePath,
+				Path:   modulePath,
+				Parsed: ast.MustParseModule(module),
+				Raw:    []byte(module),
 			},
-			Data: map[string]interface{}{
-				"members": s.lc.GetMembers(),
-			},
-			Modules: []bundle.ModuleFile{
-				{
-					URL:    modulePath,
-					Path:   modulePath,
-					Parsed: ast.MustParseModule(module),
-					Raw:    []byte(module),
-				},
-			},
-		}
-		w.Header().Set("content-type", "application/vnd.openpolicyagent.bundles")
-		w.Header().Set("etag", fmt.Sprintf("%d", rev))
-		err := bundle.NewWriter(w).Write(b)
-		if err != nil {
-			log.Printf("error creating bundle: %v\n", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		return
+		},
 	}
-
-	ch := make(chan update)
-
-	log.Printf("client is up-to-date, server revision is %d, waiting for change...", rev)
-	s.lc.AddSubscribers(ch)
-
-	select {
-	case u := <-ch:
-		log.Printf("Sending bundle update: %+v\n", u)
-		b := bundle.Bundle{
-			Manifest: bundle.Manifest{
-				Revision: fmt.Sprintf("%d", u.revision),
-			},
-			Patch: bundle.Patch{
-				Data: []bundle.PatchOperation{
-					{
-						Op:    "upsert",
-						Path:  "/members/-",
-						Value: u.data,
-					},
-				},
-			},
-		}
-		w.Header().Set("content-type", "application/vnd.openpolicyagent.bundles")
-		w.Header().Set("etag", fmt.Sprintf("%d", u.revision))
-		err := bundle.NewWriter(w).Write(b)
-		if err != nil {
-			log.Printf("error creating delta bundle: %v\n", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-	case <-time.After(clientWait):
-		w.Header().Set("Content-Type", "application/vnd.openpolicyagent.bundles")
-		w.WriteHeader(304)
+	w.Header().Set("content-type", "application/vnd.openpolicyagent.bundles")
+	w.Header().Set("etag", fmt.Sprintf("%d", revision))
+	err := bundle.NewWriter(w).Write(b)
+	if err != nil {
+		log.Printf("error creating bundle: %v\n", err)
+		w.WriteHeader(http.StatusInternalServerError)
 	}
 }
 
@@ -343,7 +371,7 @@ func main() {
 	}
 
 	go func() {
-		t := time.Tick(time.Second * 30)
+		t := time.Tick(time.Second * 5)
 		for {
 			<-t
 			err := createAndAddNewUserToGroup(s.lc)
@@ -371,15 +399,16 @@ func createAndAddNewUserToGroup(client *ldapClient) error {
 	rand.Seed(time.Now().UnixNano())
 
 	first := firstList[rand.Intn(len(firstList))]
+	full := fmt.Sprintf("%v %v", first, rand.Intn(1000000))
 	last := lastList[rand.Intn(len(lastList))]
 
-	err := client.AddUser(first, last, "password", "Users")
+	err := client.AddUser(full, last, "password", "Users")
 	if err != nil {
 		return err
 	}
 
 	// add user to group
-	return client.AddUserToGroup(first, last, "Engineering", "Users")
+	return client.AddUserToGroup(full, last, "Engineering", "Users")
 }
 
 func doLDAPSetup(client *ldapClient) error {

@@ -25,3 +25,11 @@ In another terminal start OPA.
 ```bash
 opa run -s --set services.default.url=http://localhost:8000 --set bundles.default.resource=bundle.tar.gz --set bundles.default.polling.long_polling_timeout_seconds=60
 ```
+
+OR
+
+```bash
+docker run --name opa-container -p 8181:8181 openpolicyagent/opa run -s --set services.default.url=http://docker.for.mac.host.internal:8000 --set bundles.default.resource=bundle.tar.gz --set bundles.default.polling.long_polling_timeout_seconds=60
+
+docker stats opa-container
+```
